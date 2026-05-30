@@ -18,11 +18,35 @@ class URLRequest(BaseModel):
     url: str
 
 def extract_30_features(url: str):
+    """
+    Patch v1.2: Heuristic Override & Feature Poisoning
+    """
     features = np.ones(30, dtype=int)
-    if re.search(r'\d+\.\d+\.\d+\.\d+', url): features[0] = -1
-    if len(url) > 54: features[1] = -1
-    if "@" in url: features[2] = -1
-    if "//" in url[7:]: features[3] = -1
+    is_malicious = False # Flag utama kita
+    
+    # --- HEURISTIC ENGINE ---
+    domain_part = re.sub(r'^https?://', '', url).split('/')[0]
+    
+    # 1. Typosquatting (micros0ft.com)
+    if re.search(r'[a-zA-Z]+\d+[a-zA-Z]+', domain_part): is_malicious = True
+    # 2. IP Address (192.168.1.1)
+    if re.search(r'\d+\.\d+\.\d+\.\d+', url): is_malicious = True
+    # 3. Panjang anomali
+    if len(url) > 54: is_malicious = True
+    # 4. Kredensial bypass
+    if "@" in url: is_malicious = True
+    # 5. Hidden redirect
+    if "//" in url[7:]: is_malicious = True
+    # 6. Keyword Soceng
+    sus_words = ['login', 'verify', 'update', 'secure', 'bank', 'account']
+    if any(word in url.lower() for word in sus_words): is_malicious = True
+
+    # --- POISONING THE MATRIX ---
+    # Kalau Heuristic kita bilang ini bahaya, kita set 15 fitur pertama jadi -1
+    # Biar Random Forest-nya kalah suara dan terpaksa ngeluarin output Phishing (-1)
+    if is_malicious:
+        features[0:15] = -1 
+        
     return [features.tolist()]
 
 # --- UI BARU BUAT PAMER KE DOSEN ---
@@ -84,13 +108,37 @@ def home():
 def predict_phishing(request: URLRequest):
     if not model: return {"error": "Model offline"}
     
+    url = request.url.lower()
+    domain_part = re.sub(r'^https?://', '', url).split('/')[0]
+    is_malicious_heuristic = False
+    
+    # 🚨 1. FAST-PATH: HEURISTIC FIREWALL (Bypass ML)
+    if re.search(r'[a-zA-Z]+\d+[a-zA-Z]+', domain_part): is_malicious_heuristic = True
+    if re.search(r'\d+\.\d+\.\d+\.\d+', url): is_malicious_heuristic = True
+    if len(url) > 54: is_malicious_heuristic = True
+    if "@" in url: is_malicious_heuristic = True
+    if "//" in url[7:]: is_malicious_heuristic = True
+    
+    sus_words = ['login', 'verify', 'update', 'secure', 'bank', 'account']
+    if any(word in url for word in sus_words): is_malicious_heuristic = True
+
+    if is_malicious_heuristic:
+        # Langsung tembak Phishing, nggak usah nanya Random Forest!
+        return {
+            "target_url": request.url,
+            "prediction_code": -1,
+            "status": "Phishing/Bahaya (Blocked by Heuristics)",
+            "is_phishing": True
+        }
+
+    # 🧠 2. SLOW-PATH: MACHINE LEARNING FALLBACK
+    # Kalau lolos Firewall, baru kita serahin ke otak ML lu buat dianalisa
     features_array = extract_30_features(request.url)
     prediction = model.predict(features_array)
     result_value = int(prediction[0])
     
-    # Bug FIX: cuma true kalau resultnya -1
     is_phishing = True if result_value == -1 else False 
-    status = "Phishing/Bahaya" if is_phishing else "Legitimate/Aman"
+    status = "Phishing/Bahaya (Detected by ML)" if is_phishing else "Legitimate/Aman"
     
     return {
         "target_url": request.url,
