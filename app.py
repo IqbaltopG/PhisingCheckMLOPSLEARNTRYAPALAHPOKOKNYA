@@ -1,148 +1,187 @@
-from fastapi import FastAPI
-from fastapi.responses import HTMLResponse
-from pydantic import BaseModel
+from typing import List
+from urllib.parse import urlparse
+
 import pickle
-import numpy as np
 import re
+import requests
+from bs4 import BeautifulSoup
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel, Field, HttpUrl
 
-app = FastAPI(title="Phishing Detection API")
+app = FastAPI(
+    title="Phishing Detection API",
+    description="Multi-modal phishing detection using an XGBoost URL model and live HTML page analysis.",
+    version="1.0.0",
+)
 
-# Load model Random Forest
+MODEL_PATH = "phishing_model.pkl"
+DEEP_SCAN_TIMEOUT = 6
+BRAND_KEYWORDS = {
+    "paypal",
+    "microsoft",
+    "google",
+    "facebook",
+    "apple",
+    "amazon",
+    "netflix",
+    "bank",
+    "appleid",
+    "login",
+}
+SPECIAL_CHARACTERS = set("!$^*()[]{}|<>#%\"';:,/\\`~")
+
+model = None
+model_classes = None
+model_status = "unavailable"
+
 try:
-    with open("phishing_model.pkl", "rb") as f:
+    with open(MODEL_PATH, "rb") as f:
         model = pickle.load(f)
-except Exception as e:
-    model = None
+    model_classes = getattr(model, "classes_", None)
+    model_status = MODEL_PATH
+except FileNotFoundError:
+    model_status = "missing_model_file"
+except Exception as exc:
+    model_status = f"model_load_error: {exc}"
+
 
 class URLRequest(BaseModel):
+    url: HttpUrl = Field(..., description="Target URL to analyze for phishing risk")
+
+
+class PredictionResult(BaseModel):
     url: str
+    fast_layer_probability: float
+    trigger_deep_layer: bool
+    deep_layer_scanned: bool
+    deep_layer_indicators: List[str]
+    final_decision: str
+    is_phishing: bool
+    model_status: str
 
-def extract_30_features(url: str):
-    """
-    Patch v1.2: Heuristic Override & Feature Poisoning
-    """
-    features = np.ones(30, dtype=int)
-    is_malicious = False # Flag utama kita
-    
-    # --- HEURISTIC ENGINE ---
-    domain_part = re.sub(r'^https?://', '', url).split('/')[0]
-    
-    # 1. Typosquatting (micros0ft.com)
-    if re.search(r'[a-zA-Z]+\d+[a-zA-Z]+', domain_part): is_malicious = True
-    # 2. IP Address (192.168.1.1)
-    if re.search(r'\d+\.\d+\.\d+\.\d+', url): is_malicious = True
-    # 3. Panjang anomali
-    if len(url) > 54: is_malicious = True
-    # 4. Kredensial bypass
-    if "@" in url: is_malicious = True
-    # 5. Hidden redirect
-    if "//" in url[7:]: is_malicious = True
-    # 6. Keyword Soceng
-    sus_words = ['login', 'verify', 'update', 'secure', 'bank', 'account']
-    if any(word in url.lower() for word in sus_words): is_malicious = True
 
-    # --- POISONING THE MATRIX ---
-    # Kalau Heuristic kita bilang ini bahaya, kita set 15 fitur pertama jadi -1
-    # Biar Random Forest-nya kalah suara dan terpaksa ngeluarin output Phishing (-1)
-    if is_malicious:
-        features[0:15] = -1 
-        
-    return [features.tolist()]
+def extract_url_features(url: str) -> List[int]:
+    parsed = urlparse(url)
+    if not parsed.scheme:
+        raise ValueError("URL must include a valid scheme such as http:// or https://")
 
-# --- UI BARU BUAT PAMER KE DOSEN ---
-@app.get("/", response_class=HTMLResponse)
-def home():
-    return """
-    <!DOCTYPE html>
-    <html>
-    <head>
-        <title>CyberSec URL Scanner</title>
-        <style>
-            body { font-family: 'Courier New', Courier, monospace; background-color: #0d1117; color: #00ff00; text-align: center; padding-top: 10vh; }
-            input { width: 50%; padding: 15px; font-size: 16px; background: #161b22; border: 1px solid #30363d; color: #58a6ff; border-radius: 5px; }
-            button { padding: 15px 30px; font-size: 16px; background-color: #238636; color: white; border: none; border-radius: 5px; cursor: pointer; font-weight: bold; margin-left: 10px; }
-            button:hover { background-color: #2ea043; }
-            #result-box { margin-top: 40px; padding: 20px; font-size: 24px; font-weight: bold; }
-            .phishing { color: #f85149; }
-            .safe { color: #3fb950; }
-        </style>
-    </head>
-    <body>
-        <h2>☠️ INITIALIZING PHISHING SCANNER ENGINE ☠️</h2>
-        <p>Powered by Random Forest Ensemble Model</p>
-        <div style="margin-top: 30px;">
-            <input type="text" id="urlInput" placeholder="Enter target URL (e.g., http://suspicious-site.com)">
-            <button onclick="scanURL()">SCAN</button>
-        </div>
-        <div id="result-box"></div>
+    normalized_url = url.strip().lower()
+    domain = parsed.netloc.lower()
 
-        <script>
-            async function scanURL() {
-                const url = document.getElementById('urlInput').value;
-                const resultBox = document.getElementById('result-box');
-                resultBox.innerHTML = "<span style='color: yellow;'>Scanning network packets...</span>";
-                
-                try {
-                    const res = await fetch('/predict', {
-                        method: 'POST',
-                        headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify({ url: url })
-                    });
-                    const data = await res.json();
-                    
-                    if (data.is_phishing) {
-                        resultBox.innerHTML = `🚨 STATUS: <span class="phishing">PHISHING DETECTED!</span><br><br><span style="font-size: 16px; color: #8b949e;">URL is highly malicious. Proceed with caution.</span>`;
-                    } else {
-                        resultBox.innerHTML = `✅ STATUS: <span class="safe">LEGITIMATE URL</span><br><br><span style="font-size: 16px; color: #8b949e;">No malicious patterns found.</span>`;
-                    }
-                } catch (err) {
-                    resultBox.innerHTML = "<span class='phishing'>ERROR: Server connection failed.</span>";
-                }
-            }
-        </script>
-    </body>
-    </html>
-    """
+    def count_other_special_chars(text: str) -> int:
+        return sum(1 for ch in text if ch in SPECIAL_CHARACTERS)
 
-@app.post("/predict")
-def predict_phishing(request: URLRequest):
-    if not model: return {"error": "Model offline"}
-    
-    url = request.url.lower()
-    domain_part = re.sub(r'^https?://', '', url).split('/')[0]
-    is_malicious_heuristic = False
-    
-    # 🚨 1. FAST-PATH: HEURISTIC FIREWALL (Bypass ML)
-    if re.search(r'[a-zA-Z]+\d+[a-zA-Z]+', domain_part): is_malicious_heuristic = True
-    if re.search(r'\d+\.\d+\.\d+\.\d+', url): is_malicious_heuristic = True
-    if len(url) > 54: is_malicious_heuristic = True
-    if "@" in url: is_malicious_heuristic = True
-    if "//" in url[7:]: is_malicious_heuristic = True
-    
-    sus_words = ['login', 'verify', 'update', 'secure', 'bank', 'account']
-    if any(word in url for word in sus_words): is_malicious_heuristic = True
+    return [
+        len(normalized_url),
+        len(domain),
+        int(bool(re.fullmatch(r"\d{1,3}(?:\.\d{1,3}){3}", domain))),
+        max(0, domain.count(".") - 1),
+        sum(1 for ch in normalized_url if ch.isalpha()),
+        sum(1 for ch in normalized_url if ch.isdigit()),
+        normalized_url.count("="),
+        normalized_url.count("?"),
+        normalized_url.count("&"),
+        count_other_special_chars(normalized_url),
+        int(parsed.scheme == "https"),
+    ]
 
-    if is_malicious_heuristic:
-        # Langsung tembak Phishing, nggak usah nanya Random Forest!
-        return {
-            "target_url": request.url,
-            "prediction_code": -1,
-            "status": "Phishing/Bahaya (Blocked by Heuristics)",
-            "is_phishing": True
-        }
 
-    # 🧠 2. SLOW-PATH: MACHINE LEARNING FALLBACK
-    # Kalau lolos Firewall, baru kita serahin ke otak ML lu buat dianalisa
-    features_array = extract_30_features(request.url)
-    prediction = model.predict(features_array)
-    result_value = int(prediction[0])
-    
-    is_phishing = True if result_value == -1 else False 
-    status = "Phishing/Bahaya (Detected by ML)" if is_phishing else "Legitimate/Aman"
-    
+def get_phishing_probability(url: str) -> float:
+    if model is None:
+        raise RuntimeError("Model is not loaded")
+
+    features = extract_url_features(url)
+    input_vector = [features]
+
+    if hasattr(model, "predict_proba"):
+        probabilities = model.predict_proba(input_vector)
+        if model_classes is not None and 1 in list(model_classes):
+            positive_index = list(model_classes).index(1)
+            return float(probabilities[0][positive_index])
+        return float(probabilities[0][-1])
+
+    if hasattr(model, "predict"):
+        prediction = model.predict(input_vector)
+        return float(prediction[0])
+
+    raise RuntimeError("Loaded model does not support probability prediction")
+
+
+def scan_live_html(url: str) -> dict:
+    try:
+        response = requests.get(url, timeout=DEEP_SCAN_TIMEOUT, headers={"User-Agent": "PhishingDetector/1.0"})
+        response.raise_for_status()
+    except requests.RequestException as exc:
+        raise RuntimeError(f"Failed to fetch live HTML: {exc}") from exc
+
+    soup = BeautifulSoup(response.content, "html.parser")
+    title_text = soup.title.string.strip() if soup.title and soup.title.string else ""
+    indicators = []
+
+    title_lower = title_text.lower()
+    if any(keyword in title_lower for keyword in BRAND_KEYWORDS):
+        indicators.append("BrandKeywordInTitle")
+
+    if soup.find("input", {"type": "password"}):
+        indicators.append("HasPasswordField")
+
+    login_form_found = False
+    for form in soup.find_all("form"):
+        form_text = " ".join(
+            (form.get(attr) or "").lower() for attr in ("id", "name", "action", "method")
+        )
+        if any(term in form_text for term in ("login", "signin", "sign-in")):
+            login_form_found = True
+            break
+
+        if form.find("input", {"type": ["password"]}):
+            login_form_found = True
+            break
+
+    if login_form_found:
+        indicators.append("HasLoginForm")
+
     return {
-        "target_url": request.url,
-        "prediction_code": result_value,
-        "status": status,
-        "is_phishing": is_phishing
+        "indicators": sorted(set(indicators)),
+        "page_title": title_text,
     }
+
+
+@app.get("/")
+def health_check():
+    return {
+        "status": "ok",
+        "model_status": model_status,
+        "deep_scan_timeout_seconds": DEEP_SCAN_TIMEOUT,
+    }
+
+
+@app.post("/predict", response_model=PredictionResult)
+def predict_phishing(request: URLRequest):
+    if model is None:
+        raise HTTPException(status_code=503, detail="Phishing model is unavailable")
+
+    probability = get_phishing_probability(str(request.url))
+    trigger_deep_layer = 0.15 < probability < 0.85
+    deep_scan_result = {"indicators": []}
+
+    if trigger_deep_layer:
+        try:
+            deep_scan_result = scan_live_html(str(request.url))
+        except RuntimeError as exc:
+            raise HTTPException(status_code=502, detail=str(exc))
+
+    final_decision = "Phishing" if probability >= 0.85 or deep_scan_result["indicators"] else "Legitimate"
+    if trigger_deep_layer and not deep_scan_result["indicators"]:
+        final_decision = "Legitimate"
+
+    return PredictionResult(
+        url=str(request.url),
+        fast_layer_probability=round(probability, 4),
+        trigger_deep_layer=trigger_deep_layer,
+        deep_layer_scanned=trigger_deep_layer,
+        deep_layer_indicators=deep_scan_result["indicators"],
+        final_decision=final_decision,
+        is_phishing=final_decision == "Phishing",
+        model_status=model_status,
+    )
